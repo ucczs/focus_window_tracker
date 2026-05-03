@@ -1,5 +1,8 @@
 # Focus Window tracker
 
+<img src="./media/fwt_logo.png" alt="drawing" width="200"/>
+
+
 Focus Window Tracker monitors which window is active on your desktop and logs every focus change to a CSV file. Each log entry captures:
 
 - **timestamp** — when the focus change occurred (ISO 8601)
