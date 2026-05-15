@@ -2,12 +2,16 @@ import argparse
 import csv
 import io
 import os
+import signal
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 LOG_DIR = Path(__file__).parent
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
+
+SHUTDOWN_ROW_TEMPLATE = [-1, "shutdown-process", "shutting down"]
 
 
 def default_log_file():
@@ -71,6 +75,7 @@ class ActivityLogger:
         self.log_path = log_path
         self.max_bytes = max_bytes
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._open_log_file()
 
     def _open_log_file(self):
@@ -92,15 +97,56 @@ class ActivityLogger:
         return self.log_path.stat().st_size + self._row_bytes(row) > self.max_bytes
 
     def write(self, row):
-        if self._should_rotate(row):
-            self._raw_file.close()
-            rotate_log_file(self.log_path)
-            self._open_log_file()
-        self._writer.writerow(row)
-        self._raw_file.flush()
+        with self._lock:
+            if self._should_rotate(row):
+                self._raw_file.close()
+                rotate_log_file(self.log_path)
+                self._open_log_file()
+            self._writer.writerow(row)
+            self._raw_file.flush()
+
+    def write_shutdown_event(self):
+        self.write([datetime.now().isoformat()] + SHUTDOWN_ROW_TEMPLATE)
 
     def close(self):
-        self._raw_file.close()
+        with self._lock:
+            self._raw_file.close()
+
+def start_sleep_listener(logger):
+    """Subscribe to systemd-logind's PrepareForSleep D-Bus signal (via jeepney).
+
+    Runs in a daemon thread. Writes a shutdown event before each suspend.
+    Falls back gracefully if jeepney is not installed.
+    """
+    try:
+        from jeepney import DBus, MatchRule
+        from jeepney.io.blocking import open_dbus_connection
+    except ModuleNotFoundError:
+        print("[tracker] jeepney not found – sleep detection disabled. "
+              "Install it with: pip install jeepney")
+        return
+
+    def _listen():
+        try:
+            conn = open_dbus_connection(bus="SYSTEM")
+            rule = MatchRule(
+                type="signal",
+                interface="org.freedesktop.login1.Manager",
+                member="PrepareForSleep",
+                path="/org/freedesktop/login1",
+            )
+            conn.send_and_get_reply(DBus().AddMatch(rule))
+            while True:
+                msg = conn.receive()
+                # body is (before,) – True means "about to sleep"
+                if msg.body and msg.body[0]:
+                    logger.write_shutdown_event()
+        except Exception as exc:
+            print(f"[tracker] Sleep listener error: {exc}")
+
+    t = threading.Thread(target=_listen, daemon=True, name="sleep-listener")
+    t.start()
+
 
 def create_window_manager():
     try:
@@ -132,6 +178,18 @@ def get_active_window_info(window_manager):
 def main():
     args = parse_args()
     logger = ActivityLogger(Path(args.log_file).expanduser(), args.max_bytes)
+
+    # Write a shutdown row on SIGTERM (systemd sends this on system shutdown)
+    def _sigterm_handler(signum, frame):
+        logger.write_shutdown_event()
+        logger.close()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # Write a shutdown row before each suspend/sleep
+    start_sleep_listener(logger)
+
     window_manager = create_window_manager()
     last = None
     try:

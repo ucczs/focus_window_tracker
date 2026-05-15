@@ -1,2 +1,3 @@
 ewmh==0.1.6
+jeepney
 xlib==0.21
